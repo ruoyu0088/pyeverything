@@ -1,123 +1,236 @@
+from __future__ import print_function
+import os
 from os import path
-import cPickle
 from array import array
-import bz2
 import struct
+import sys
+import re
+from bisect import bisect_right
 
-FOLDER_COUNT_POS = 0x0c
-ENTRY_POS = 0x4e
 
+class StringBuffer(object):
 
-class EverythingDB(object):
-    CACHE_FN = path.join(path.dirname(__file__), "everything.cache")
+    def __init__(self):
+        self.buf = ""
+        self.positions = array("L")
+        self.lengths = array("H")
 
-    def __init__(self, fn):
-        if not path.exists(self.CACHE_FN) or path.getmtime(fn) > path.getmtime(self.CACHE_FN):
-            self._load_db(fn)
-            with open(self.CACHE_FN, "wb") as f:
-                cPickle.dump((self.items, self.parents), f, protocol=cPickle.HIGHEST_PROTOCOL)
-        else:
-            with open(self.CACHE_FN, "rb") as f:
-                self.items, self.parents = cPickle.load(f)
+    @classmethod
+    def from_items(cls, items):
+        self = cls()
+        positions = self.positions
+        lengths = self.lengths
+        pos = 0
+        for item in items:
+            positions.append(pos)
+            length = len(item)
+            lengths.append(length)
+            pos += length + 1
 
-    def _load_db(self, fn):
-        with bz2.BZ2File(fn) as f:
-            f.seek(FOLDER_COUNT_POS)
-            folder_count, file_count = struct.unpack("LL", f.read(8))
-            f.seek(ENTRY_POS, 0)
+        positions.append(pos)
+        self.buf = b"\n".join(items)
+        return self
 
-            last_str = ""
+    @classmethod
+    def from_file(cls, f):
+        item_count, char_count = struct.unpack("LL", f.read(8))
+        self = cls()
+        self.positions.fromfile(f, item_count + 1)
+        self.lengths.fromfile(f, item_count)
+        self.buf = f.read(char_count)
+        return self
 
-            items = []
-            locations = []
-            parents_buffer = bytearray()
+    def tofile(self, f):
+        f.write(struct.pack("LL", len(self.lengths), len(self.buf)))
+        self.positions.tofile(f)
+        self.lengths.tofile(f)
+        f.write(self.buf)
 
-            loc = 0
-            for i in xrange(folder_count):
-                locations.append(loc)
-                info = f.read(0x11)
-                parents_buffer.extend(info[-8:-4])
-                length = ord(f.read(1))
-                if length == 0:
-                    drop_length = 0
-                else:
-                    drop_length = ord(f.read(1))
+    def __getitem__(self, item):
+        start = self.positions[item]
+        return self.buf[start:start+self.lengths[item]]
 
-                if length != 0:
-                    s = f.read(length)
-                    last_str = last_str[:len(last_str)-drop_length] + s
-                items.append(last_str)
-                loc += len(last_str) + 14
+    def __len__(self):
+        return len(self.length)
 
-            last_str = ""
+    def iter_locations(self, pattern):
+        buf = self.buf
+        start = 0
+        count = len(pattern)
 
-            for i in xrange(file_count):
-                info = f.read(4)
-                parents_buffer.extend(info)
-                length = ord(f.read(1))
-                drop_length = 0 if not length else ord(f.read(1))
-                if length != 0:
-                    s = f.read(length)
-                    last_str = last_str[:len(last_str)-drop_length] + s
-                items.append(last_str)
-
-            parents = array("L")
-            parents.fromstring(str(parents_buffer))
-
-            location_map = {loc:idx for idx, loc in enumerate(locations)}
-            location_map[0xffffffff] = -1
-            parents = [location_map[loc] for loc in parents]
-            self.items = items
-            self.parents = parents
-
-    def full_path(self, idx):
-        names = [self.items[idx]]
         while True:
-            idx = self.parents[idx]
-            if idx == -1:
+            loc = buf.find(pattern, start)
+            if loc < 0:
                 break
-            names.append(self.items[idx])
-        return "/".join(names[::-1])
+            yield loc
+            start = loc + count
 
     def find_all(self, pattern, use_re=False):
         if not use_re:
-            index_list = (i for i, name in enumerate(self.items) if pattern in name)
+            locations = self.iter_locations(pattern)
         else:
-            import re
-            pattern = re.compile(pattern, re.IGNORECASE)
-            method = pattern.match
-            index_list = (i for i, name in enumerate(self.items) if method(name))
+            locations = (m.start() for m in re.finditer(b"^" + pattern + b"$", self.buf, re.IGNORECASE|re.MULTILINE))
 
-        items = self.items
-        parents = self.parents
+        start_index = 0
+        start_loc = 0
+        positions = self.positions
 
-        names = []
-        append = names.append
-        for index in index_list:
-            del names[:]
-            while True:
-                append(items[index])                
-                index = parents[index]
-                if index == -1:
-                    break
-            yield "/".join(reversed(names))
+        for loc in locations:
+            if loc < start_loc:
+                continue
+            index = bisect_right(positions, loc, lo=start_index) - 1
+            start_index = index + 1
+            start_loc = positions[start_index]
+            yield index
 
     def __sizeof__(self):
-        size1 = sys.getsizeof(self.parents) + sum(sys.getsizeof(x) for x in self.parents)
-        size2 = sys.getsizeof(self.items) + sum(sys.getsizeof(x) for x in self.items)
-        return sys.getsizeof(self.__dict__) + size1 + size2
+        return sum(sys.getsizeof(x) for x in (self.positions, self.lengths, self.buf))
 
+
+class EverythingDB(object):
+    FOLDER_COUNT_POS = 0x0c
+    CACHE_FN = path.join(path.dirname(__file__), "everything.cache")
+
+    def __init__(self):
+        self.items = None
+        self.folder_count = None
+        self.parents = array("L")
+
+    @classmethod
+    def from_cache(cls, fn):
+        self = cls()
+        with open(fn, "rb") as f:
+            self.folder_count, item_count = struct.unpack("LL", f.read(8))
+            self.parents.fromfile(f, item_count)
+            self.items = StringBuffer.from_file(f)
+        return self
+
+    def tofile(self, fn):
+        with open(fn, "wb") as f:
+            f.write(struct.pack("LL", self.folder_count, len(self.parents)))
+            self.parents.tofile(f)
+            self.items.tofile(f)
+
+    @classmethod
+    def from_db(cls, fn):
+        self = cls()
+        with open(fn, "rb") as f:
+            f.seek(cls.FOLDER_COUNT_POS)
+            folder_count, file_count = struct.unpack("LL", f.read(8))
+            f.read(3)
+            while True:
+                c = f.read(1)
+                if c == b"\x00":
+                    break
+            f.read(4)
+            f.read(0x14)
+
+            buf1 = f.read(folder_count * 4)
+            buf2 = f.read(folder_count * 4)
+
+            f.read(4)
+
+            last_str = b""
+            items = []
+
+            for i in range(folder_count):
+                length = ord(f.read(1))
+                drop_length = 0 if length == 0 else ord(f.read(1))
+                s = f.read(length) if length > 0 else b""
+                info = f.read(8)
+                #the info can be get by fsutil usn readdata  it's call FileRef#
+                last_str = last_str[:len(last_str)-drop_length] + s
+                items.append(last_str)
+
+            last_str = b""
+            parents_buf = bytearray()
+            parents_buf.extend(buf1)
+            for i in range(file_count):
+                info = f.read(4)
+                parents_buf.extend(info)
+                length = ord(f.read(1))
+                drop_length = 0 if length == 0 else ord(f.read(1))
+                s = f.read(length) if length > 0 else b""
+                last_str = last_str[:len(last_str)-drop_length] + s
+                items.append(last_str)
+
+            self.folder_count = folder_count
+            self.items = StringBuffer.from_items(items)
+            self.parents.fromstring(bytes(parents_buf))
+            return self
+
+    def full_path(self, idx):
+        names = [self.items[idx]]
+        count = self.folder_count
+        while True:
+            idx = self.parents[idx]
+            if idx >= count:
+                break
+            names.append(self.items[idx])
+        return path.sep.encode("utf8").join(names[::-1])
+
+    def find_all(self, pattern, use_re=False):
+        pattern = pattern.encode("utf8")
+        index_generator = self.items.find_all(pattern, use_re)
+        items = self.items
+        parents = self.parents
+        count = self.folder_count
+        names = []
+        append = names.append
+        sep = path.sep.encode("utf8")
+        for index in index_generator:
+            del names[:]
+            while True:
+                append(items[index])
+                index = parents[index]
+                if index >= count:
+                    break
+            yield sep.join(reversed(names))
+
+    def __sizeof__(self):
+        return sum(sys.getsizeof(x) for x in (self.parents, self.items))
+
+
+def open_everything(fn=None, use_cache=True):
+    if fn is None:
+        fn = path.join(os.environ['APPDATA'], r"Everything\Everything.db")
+
+    cache_fn = EverythingDB.CACHE_FN
+    if not use_cache or not path.exists(cache_fn) or path.getmtime(fn) > path.getmtime(cache_fn):
+        db = EverythingDB.from_db(fn)
+        db.tofile(cache_fn)
+        return db
+    else:
+        return EverythingDB.from_cache(cache_fn)
+
+
+def test_string_buffer():
+    sb = StringBuffer.from_items([b"bcabcdbcdbcbcbc", b"xyz", b"ahbca", b"1234"])
+    assert sb[1] == b"xyz"
+    flag = False
+    assert list(sb.find_all(b"bc", use_re=flag)) == [0, 2]
+    assert list(sb.find_all(b"xyz", use_re=flag)) == [1]
+    assert list(sb.find_all(b"123", use_re=flag)) == [3]
+    assert list(sb.find_all(b"234", use_re=flag)) == [3]
+    assert list(sb.find_all(b"12345", use_re=flag)) == []
+    flag = True
+    assert list(sb.find_all(b".*bc.*", use_re=flag)) == [0, 2]
+    assert list(sb.find_all(b".*xyz.*", use_re=flag)) == [1]
+    assert list(sb.find_all(b".*123.*", use_re=flag)) == [3]
+    assert list(sb.find_all(b".*234.*", use_re=flag)) == [3]
+    assert list(sb.find_all(b".*12345.*", use_re=flag)) == []
+
+def main():
+    db = open_everything()
+    try:
+        pattern = sys.argv[1]
+    except IndexError:
+        pattern = ".*python.*\.exe"
+
+    print("all items that match:", pattern)
+    for p in db.find_all(pattern, use_re=True):
+        print(p.decode("utf8"))
 
 if __name__ == '__main__':
-    fn = r"C:\Program Files\Everything\Everything.db"
-    import sys
-    import time
-    start = time.clock()
-    db = EverythingDB(fn)
-    print time.clock() - start
-    start = time.clock()
-    res = list(db.find_all(sys.argv[1], use_re=True))
-    #print time.clock() - start
-    print "\n".join(res)
-    with open("result.txt", "w") as f:
-        f.write("\n".join(res))
+    test_string_buffer()
+    main()
