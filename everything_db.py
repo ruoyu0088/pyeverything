@@ -6,6 +6,7 @@ import struct
 import sys
 import re
 from bisect import bisect_right
+import fnmatch
 
 
 class StringBuffer(object):
@@ -65,10 +66,12 @@ class StringBuffer(object):
             yield loc
             start = loc + count
 
-    def find_all(self, pattern, use_re=False):
-        if not use_re:
+    def find_all(self, pattern, method="find"):
+        if method == "find":
             locations = self.iter_locations(pattern)
         else:
+            if method == "fnmatch":
+                pattern = fnmatch.translate(pattern).replace('\Z(?ms)', '')
             locations = (m.start() for m in re.finditer(b"^" + pattern + b"$", self.buf, re.IGNORECASE|re.MULTILINE))
 
         start_index = 0
@@ -169,9 +172,9 @@ class EverythingDB(object):
             names.append(self.items[idx])
         return path.sep.encode("utf8").join(names[::-1])
 
-    def find_all(self, pattern, use_re=False):
+    def find_all(self, pattern, method="find"):
         pattern = pattern.encode("utf8")
-        index_generator = self.items.find_all(pattern, use_re)
+        index_generator = self.items.find_all(pattern, method)
         items = self.items
         parents = self.parents
         count = self.folder_count
@@ -207,30 +210,67 @@ def open_everything(fn=None, use_cache=True):
 def test_string_buffer():
     sb = StringBuffer.from_items([b"bcabcdbcdbcbcbc", b"xyz", b"ahbca", b"1234"])
     assert sb[1] == b"xyz"
-    flag = False
-    assert list(sb.find_all(b"bc", use_re=flag)) == [0, 2]
-    assert list(sb.find_all(b"xyz", use_re=flag)) == [1]
-    assert list(sb.find_all(b"123", use_re=flag)) == [3]
-    assert list(sb.find_all(b"234", use_re=flag)) == [3]
-    assert list(sb.find_all(b"12345", use_re=flag)) == []
-    flag = True
-    assert list(sb.find_all(b".*bc.*", use_re=flag)) == [0, 2]
-    assert list(sb.find_all(b".*xyz.*", use_re=flag)) == [1]
+    flag = "find"
+    assert list(sb.find_all(b"bc", method=flag)) == [0, 2]
+    assert list(sb.find_all(b"xyz", method=flag)) == [1]
+    assert list(sb.find_all(b"123", method=flag)) == [3]
+    assert list(sb.find_all(b"234", method=flag)) == [3]
+    assert list(sb.find_all(b"12345", method=flag)) == []
+    flag = "re"
+    assert list(sb.find_all(b".*bc.*", method=flag)) == [0, 2]
+    assert list(sb.find_all(b".*xyz.*", method=flag)) == [1]
     assert list(sb.find_all(b".*123.*", use_re=flag)) == [3]
-    assert list(sb.find_all(b".*234.*", use_re=flag)) == [3]
-    assert list(sb.find_all(b".*12345.*", use_re=flag)) == []
+    assert list(sb.find_all(b".*234.*", method=flag)) == [3]
+    assert list(sb.find_all(b".*12345.*", method=flag)) == []
+
 
 def main():
-    db = open_everything()
-    try:
-        pattern = sys.argv[1]
-    except IndexError:
-        pattern = ".*python.*\.exe"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file_pattern", help="filename")
+    parser.add_argument("-f", "--folder", help="folder pattern", type=str, default="")
+    parser.add_argument("-c", "--content", help="content pattern", type=str, default="")
 
-    print("all items that match:", pattern)
-    for p in db.find_all(pattern, use_re=True):
-        print(p.decode("utf8"))
+    args = parser.parse_args()
+    db = open_everything()
+
+    def find_files():
+        for p in db.find_all(args.file_pattern, method="fnmatch"):
+            yield p
+
+    def filter_folder(items):
+        return (p for p in items if args.folder in path.dirname(p))
+
+    def filter_content(items):
+        for p in items:
+            if not path.exists(p):
+                continue
+
+            if path.getsize(p) > 50e6:
+                yield  p, "too big"
+            else:
+                try:
+                    with open(p, "rb") as f:
+                        text = f.read()
+                        if args.content in text:
+                            yield p
+                except IOError:
+                    yield p, "can't read"
+
+    items = find_files()
+
+    if args.folder:
+        items = filter_folder(items)
+    if args.content:
+        items = filter_content(items)
+
+    for item in items:
+        fn, info = item if isinstance(item, tuple) else (item, "")
+        fn = fn.decode("utf8").encode(sys.stdout.encoding, errors="replace")
+        if info:
+            print("{} {}".format(fn, info))
+        else:
+            print(fn)
 
 if __name__ == '__main__':
-    test_string_buffer()
     main()
